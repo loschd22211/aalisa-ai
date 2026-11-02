@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+_reply.wav
+*.onnx
+*.onnx.json
