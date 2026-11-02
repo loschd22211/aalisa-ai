@@ -80,7 +80,7 @@ FEATURES = {
     "deepseek": True,
     "vk_music": True,
     "status_bar": True,
-    "voice_gui": False,
+    "voice_gui": True,
 }
 
 # Архитектурные заготовки: НЕ реализованы в этой итерации.
