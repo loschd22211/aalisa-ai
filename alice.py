@@ -77,7 +77,7 @@ HEALTH_INTERVAL_MS = 5000             # индикаторы обновляют�
 
 # Включаются последовательно по блокам: 1 → B → C → E → D.
 FEATURES = {
-    "deepseek": False,
+    "deepseek": True,
     "vk_music": False,
     "status_bar": False,
     "voice_gui": False,
@@ -651,6 +651,9 @@ def wait_captcha(page, status, timeout=DEEPSEEK_CAPTCHA_TIMEOUT):
 
 
 def wait_deepseek_login(page, status):
+    # Уже залогинены — не беспокоим пользователя лишним сообщением.
+    if has_any(page, DEEPSEEK["logged_in"]):
+        return True
     emit_status(status, "Залогинься в окне браузера (один раз)")
     return poll_until(
         lambda: has_any(page, DEEPSEEK["logged_in"]),
@@ -697,43 +700,53 @@ def wait_deepseek_answer(page, status, baseline):
 
 def deepseek_answer(session, query, status=print):
     emit_status(status, "Открываю DeepSeek…")
-    if session.page is None:
-        session.open()
-    page = session.page
     try:
-        page.goto(DEEPSEEK["url"], wait_until="domcontentloaded", timeout=30000)
-    except Exception as e:
-        return False, f"Не удалось открыть DeepSeek. Проверь сеть: {e}"
-
-    if not wait_deepseek_login(page, status):
-        return False, "Не дождалась логина в DeepSeek за 5 минут. Открой /браузер и залогинься."
-    if not wait_captcha(page, status):
-        return False, "Капча не подтверждена за 3 минуты."
-
-    field = wait_for_locator(page, DEEPSEEK["input"], 15, status, "Ищу поле ввода DeepSeek…")
-    if field is None:
-        return False, "Сайт изменился: не нашла поле ввода DeepSeek."
-    fill_locator(page, field, query)
-    baseline, _ = answer_snapshot(page)
-    if not click_first(page, DEEPSEEK["send"]):
+        if session.page is None:
+            session.open()
+        page = session.page
         try:
-            field.press("Enter")
+            page.goto(DEEPSEEK["url"], wait_until="domcontentloaded", timeout=30000)
         except Exception as e:
-            return False, f"Не удалось отправить запрос в DeepSeek: {e}"
-    return wait_deepseek_answer(page, status, baseline)
+            return False, f"Не удалось открыть DeepSeek. Проверь сеть: {e}"
 
+        if not wait_deepseek_login(page, status):
+            return False, "Не дождалась логина в DeepSeek за 5 минут. Открой /браузер и залогинься."
+        if not wait_captcha(page, status):
+            return False, "Капча не подтверждена за 3 минуты."
+
+        field = wait_for_locator(page, DEEPSEEK["input"], 15, status, "Ищу поле ввода DeepSeek…")
+        if field is None:
+            return False, "Сайт изменился: не нашла поле ввода DeepSeek."
+        fill_locator(page, field, query)
+        baseline, _ = answer_snapshot(page)
+        if not click_first(page, DEEPSEEK["send"]):
+            try:
+                field.press("Enter")
+            except Exception as e:
+                return False, f"Не удалось отправить запрос в DeepSeek: {e}"
+        return wait_deepseek_answer(page, status, baseline)
+    except Exception as e:
+        try:
+            session.close()
+        except Exception:
+            pass
+        return False, f"Не удалось получить ответ DeepSeek. Сайт мог измениться: {e}"
 
 def browser_setup(session, status=print):
-    session.open()
     try:
+        session.open()
         session.page.goto(DEEPSEEK["url"], wait_until="domcontentloaded", timeout=30000)
-        session.vk_page = session.context.new_page()
-        session.vk_page.goto(VK_MUSIC["url"], wait_until="domcontentloaded", timeout=30000)
+        if FEATURES["vk_music"]:
+            session.vk_page = session.context.new_page()
+            session.vk_page.goto(VK_MUSIC["url"], wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
         session.close()
         return False, f"Не удалось открыть окна для логина: {e}"
 
-    emit_status(status, "Окно браузера ассистента открыто. Залогинься в DeepSeek и VK Музыке, затем закрой его.")
+    if FEATURES["vk_music"]:
+        emit_status(status, "Окно браузера ассистента открыто. Залогинься в DeepSeek и VK Музыке, затем закрой его.")
+    else:
+        emit_status(status, "Окно браузера ассистента открыто. Залогинься в DeepSeek, затем закрой его.")
     started = time.monotonic()
     last_second = -1
     while time.monotonic() - started < BROWSER_SETUP_TIMEOUT:
@@ -912,7 +925,7 @@ class ConsoleBrowser:
                 if self.session:
                     self.session.close()
                     self.session = None
-                return False, f"Ошибка браузера: {e}"
+                return False, f"Не удалось выполнить действие в браузере. Состояние сброшено: {e}"
 
     def close(self):
         with self.lock:
@@ -1307,7 +1320,7 @@ def main_gui():
                     if self.session:
                         self.session.close()
                         self.session = None
-                    self.result.emit(f"Ошибка браузера: {e}", False, intent.get("kind", ""))
+                    self.result.emit(f"Не удалось выполнить действие в браузере. Состояние сброшено: {e}", False, intent.get("kind", ""))
 
     class VoiceWorker(QObject):
         status = Signal(str)
@@ -1343,6 +1356,7 @@ def main_gui():
             self.history = [{"role": "system", "content": SYSTEM}]
             self.ollama_ready = False
             self.busy = False
+            self.important_statuses = set()
             self.assistant_open = False
             self.live_marker = None
             self.first_local_request = True
@@ -1508,6 +1522,8 @@ def main_gui():
             self.input.setEnabled(not busy)
             for button in self.action_buttons:
                 button.setEnabled(not busy)
+            if busy:
+                self.important_statuses.clear()
             if label:
                 self.status_label.setText(label)
 
@@ -1516,7 +1532,24 @@ def main_gui():
             self.status_label.setText(text)
             # Во время стриминга ответа не вставляем таймер в ленту,
             # иначе он «разрывает» печатаемую строку Алисы.
-            if not self.assistant_open:
+            if self.assistant_open:
+                return
+            # Ключевые этапы остаются в истории ленты, а односекундные
+            # таймеры обновляют только одну живую строку.
+            key = next((
+                prefix for prefix in (
+                    "Открываю DeepSeek",
+                    "Залогинься в окне браузера",
+                    "Ответь на капчу",
+                    "Ищу в VK Музыке",
+                    "Открой VK",
+                    "Окно браузера ассистента открыто",
+                ) if text.startswith(prefix)
+            ), None)
+            if key and key not in self.important_statuses:
+                self.append_status(text)
+                self.important_statuses.add(key)
+            else:
                 self.set_live_status(text)
 
         # ---------- Ollama ----------
