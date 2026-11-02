@@ -3,3 +3,4 @@ faster-whisper
 piper-tts
 sounddevice
 numpy
+PySide6
