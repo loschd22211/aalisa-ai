@@ -78,7 +78,7 @@ HEALTH_INTERVAL_MS = 5000             # индикаторы обновляют�
 # Включаются последовательно по блокам: 1 → B → C → E → D.
 FEATURES = {
     "deepseek": True,
-    "vk_music": False,
+    "vk_music": True,
     "status_bar": False,
     "voice_gui": False,
 }
