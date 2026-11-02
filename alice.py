@@ -79,7 +79,7 @@ HEALTH_INTERVAL_MS = 5000             # индикаторы обновляют�
 FEATURES = {
     "deepseek": True,
     "vk_music": True,
-    "status_bar": False,
+    "status_bar": True,
     "voice_gui": False,
 }
 
