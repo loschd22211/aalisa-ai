@@ -13,16 +13,21 @@
 """
 
 import argparse
+import ctypes
 import html
 import importlib.util
+import json
 import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import wave
 from pathlib import Path
 
@@ -36,6 +41,17 @@ try:
 except ImportError:
     print("Нет пакета ollama. Выполни:  pip install ollama")
     sys.exit(1)
+
+# Уже установленные на машине владельца библиотеки; при отсутствии
+# используем встроенные fallback'ы, поэтому новых зависимостей не появляется.
+try:
+    import requests
+except Exception:
+    requests = None
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 # Голосовой стек может отсутствовать — окно и консоль всё равно работают.
 try:
@@ -75,13 +91,33 @@ VK_LOGIN_TIMEOUT = 300
 VK_ACTION_TIMEOUT = 60
 HEALTH_INTERVAL_MS = 5000             # индикаторы обновляются раз в 5 секунд
 
+OLLAMA_HOST = "127.0.0.1"
+OLLAMA_PORT = 11434
+OLLAMA_API_TIMEOUT = 2                # прямой HTTP GET /api/version
+OLLAMA_BUG_WAIT = 10                  # «трей жив, API мёртв» — сначала ждём
+OLLAMA_POLL_INTERVAL = 0.5            # опрос HTTP при ожидании готовности
+OLLAMA_LAUNCH_STEP_TIMEOUT = 5        # лимит на каждый способ запуска
+OLLAMA_CLIENT_TIMEOUT = 10            # ollama.exe list сам ждёт ~5 с
+LOG_MAX_BYTES = 1024 * 1024           # при открытии обрезаем лог до ~1 МБ
+SINGLE_INSTANCE_NAME = "Local\AliceSingleInstance"
+
 # Включаются последовательно по блокам: 1 → B → C → E → D.
 FEATURES = {
     "deepseek": True,
     "vk_music": True,
     "status_bar": True,
     "voice_gui": True,
+    "autostart": True,                # /автозагрузка и README настроены
 }
+
+OLLAMA_LAST_ERROR = ""
+OLLAMA_LAST_DETAILS = []
+OLLAMA_TRIED_PATHS = []
+OLLAMA_EXIT_CODES = []
+OLLAMA_LOG_HANDLES = []
+MODEL_MISSING = False
+SINGLE_INSTANCE_HANDLE = None
+SINGLE_INSTANCE_FD = None
 
 # Архитектурные заготовки: НЕ реализованы в этой итерации.
 FUTURE_HOOKS = {
@@ -200,6 +236,510 @@ DEEPSEEK = WEB_SELECTORS["deepseek"]
 VK_MUSIC = WEB_SELECTORS["vk_music"]
 
 
+# ==================== ЛОГ И ДИАГНОСТИКА OLLAMA ====================
+def alice_log_dir():
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        return Path(base) / "Alice"
+    return Path.home() / ".alice"
+
+
+def alice_log_path():
+    return alice_log_dir() / "alice.log"
+
+
+LOG_PATH = alice_log_path()
+
+
+def log_path_text():
+    try:
+        return str(alice_log_path())
+    except Exception:
+        return str(LOG_PATH)
+
+
+def init_log():
+    """Создаёт каталог лога и обрезает старый файл до ~1 МБ при запуске."""
+    try:
+        path = alice_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+            keep = LOG_MAX_BYTES // 2
+            with path.open("rb") as f:
+                f.seek(max(0, path.stat().st_size - keep))
+                tail = f.read()
+            path.write_bytes(b"... log truncated ...\n" + tail)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"=== Алиса {ALICE_VERSION} запущена: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    except Exception as e:
+        print(f"[Не удалось открыть лог Алисы: {e}]")
+
+
+def log_event(message, **fields):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}"
+    for key, value in fields.items():
+        if value not in (None, "", [], {}):
+            line += f" | {key}={value}"
+    try:
+        path = alice_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def log_tail(limit=8):
+    try:
+        lines = alice_log_path().read_text(encoding="utf-8", errors="replace").splitlines()
+        return " | ".join(line.strip() for line in lines[-limit:])
+    except Exception:
+        return ""
+
+
+def with_log_path(text):
+    if "alice.log" in text:
+        return text
+    return f"{text} Подробности: {log_path_text()}"
+
+
+def ensure_status(status, text, started=None):
+    """Статус в ленту с таймером + обязательная запись в лог-файл."""
+    emit_status(status, text, started)
+    log_event(f"СТАТУС: {text}")
+
+
+def ollama_api_get(path, timeout=OLLAMA_API_TIMEOUT):
+    """Прямой HTTP GET к локальному API; не зависит от клиентской библиотеки."""
+    url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}{path}"
+    if requests is not None:
+        try:
+            response = requests.get(url, timeout=timeout)
+            code = getattr(response, "status_code", 200)
+            if code != 200:
+                return False, None, f"HTTP {code}"
+            try:
+                return True, response.json(), None
+            except Exception:
+                return True, getattr(response, "text", ""), None
+        except Exception as e:
+            return False, None, str(e)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            try:
+                return True, json.loads(raw), None
+            except Exception:
+                return True, raw, None
+    except Exception as e:
+        return False, None, str(e)
+
+
+def ollama_api_alive(log=False):
+    ok, payload, error = ollama_api_get("/api/version", OLLAMA_API_TIMEOUT)
+    if log:
+        log_event("HTTP /api/version", ok=ok, error=error, version=payload if ok else None)
+    return ok
+
+
+class OllamaProc:
+    def __init__(self, pid, name, exe="", cmdline=None, source="psutil"):
+        self.pid = int(pid)
+        self.name = name or ""
+        self.exe = exe or ""
+        self.cmdline = list(cmdline or [])
+        self.source = source
+        low_name = self.name.lower()
+        low_exe = self.exe.lower()
+        low_cmd = " ".join(self.cmdline).lower()
+        self.is_tray = "ollama app" in low_name or "ollama app" in low_exe
+        self.is_server = (
+            "serve" in low_cmd
+            or "ollamaserver" in low_name
+            or "ollamaserver" in low_exe
+            or (low_name.startswith("ollama.exe") and "serve" in low_cmd)
+        )
+
+    def describe(self):
+        role = "трей" if self.is_tray else ("сервер" if self.is_server else "процесс")
+        return f"PID {self.pid} {self.name} ({role})"
+
+    def __repr__(self):
+        return self.describe()
+
+
+def ollama_processes():
+    """Ищет все ollama* процессы: psutil, а при его отсутствии — tasklist."""
+    result = []
+    if psutil is not None:
+        try:
+            for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+                info = getattr(proc, "info", {}) or {}
+                name = str(info.get("name") or "")
+                exe = str(info.get("exe") or "")
+                cmdline = [str(x) for x in (info.get("cmdline") or [])]
+                joined = " ".join([name, exe] + cmdline).lower()
+                if "ollama" in joined:
+                    result.append(OllamaProc(info.get("pid") or 0, name, exe, cmdline, "psutil"))
+            return result
+        except Exception as e:
+            log_event("psutil process_iter failed", error=e)
+    if os.name == "nt":
+        try:
+            raw = subprocess.check_output(
+                ["tasklist", "/FO", "CSV", "/NH"], text=True, timeout=5
+            )
+            for line in raw.splitlines():
+                parts = [x.strip('"') for x in line.split('","')]
+                if len(parts) >= 2 and "ollama" in parts[0].lower():
+                    try:
+                        pid = int(parts[1])
+                    except Exception:
+                        continue
+                    result.append(OllamaProc(pid, parts[0], "", [], "tasklist"))
+        except Exception as e:
+            log_event("tasklist failed", error=e)
+    return result
+
+
+def format_processes(procs):
+    if not procs:
+        return "нет"
+    return "; ".join(p.describe() for p in procs[:8])
+
+
+def ollama_install_dirs():
+    roots = []
+    candidates = []
+    if os.name == "nt":
+        for var in ("LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+            value = os.environ.get(var)
+            if value:
+                base = Path(value)
+                candidates.extend([base / "Programs" / "Ollama", base / "Ollama"])
+    else:
+        value = os.environ.get("LOCALAPPDATA")
+        if value:
+            candidates.append(Path(value) / "Programs" / "Ollama")
+        candidates.append(Path.home() / ".local" / "share" / "ollama")
+    found = shutil.which("ollama")
+    if found:
+        candidates.append(Path(found).resolve().parent)
+    for candidate in candidates:
+        try:
+            if candidate.is_dir() and str(candidate) not in roots:
+                roots.append(str(candidate))
+        except Exception:
+            continue
+    return roots
+
+
+def find_ollama_exes():
+    """Динамически перечисляет каталог установки, а не хардкодит одно имя."""
+    dirs = ollama_install_dirs()
+    all_exes = []
+    for dirname in dirs:
+        try:
+            for exe in sorted(Path(dirname).glob("*.exe")):
+                if "ollama" in exe.name.lower() and str(exe) not in all_exes:
+                    all_exes.append(str(exe))
+        except Exception as e:
+            log_event("Не удалось перечислить каталог Ollama", path=dirname, error=e)
+    app = None
+    cli = None
+    server = None
+    for item in all_exes:
+        low = Path(item).name.lower()
+        if app is None and ("ollama app" in low or ("app" in low and "ollama" in low)):
+            app = item
+        elif server is None and "server" in low and "ollama" in low:
+            server = item
+        elif cli is None and "ollama" in low and "app" not in low and "server" not in low:
+            cli = item
+    return {"dirs": dirs, "all": all_exes, "app": app, "cli": cli, "server": server}
+
+
+def port_in_use(host=OLLAMA_HOST, port=OLLAMA_PORT):
+    """Порт занят, даже если HTTP на него не отвечает."""
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+    except Exception as e:
+        log_event("Проверка порта не удалась", error=e)
+        return False
+
+
+def windows_spawn_flags():
+    startupinfo = None
+    flags = 0
+    if os.name == "nt":
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+            startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        except Exception:
+            startupinfo = None
+        flags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+        if not flags:
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return startupinfo, flags
+
+
+def open_child_log_handle():
+    path = alice_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a", encoding="utf-8")
+    OLLAMA_LOG_HANDLES.append(handle)
+    return handle
+
+
+def spawn_ollama_process(args, label, status):
+    ensure_status(status, f"Запускаю {label}…")
+    handle = open_child_log_handle()
+    startupinfo, flags = windows_spawn_flags()
+    kwargs = dict(
+        cwd=str(Path(args[0]).parent),
+        env=ollama_env(),
+        stdin=subprocess.DEVNULL,
+        stdout=handle,
+        stderr=subprocess.STDOUT,
+        close_fds=True,
+    )
+    if startupinfo is not None:
+        kwargs["startupinfo"] = startupinfo
+    if flags:
+        kwargs["creationflags"] = flags
+    proc = subprocess.Popen(args, **kwargs)
+    OLLAMA_TRIED_PATHS.append(str(args[0]))
+    log_event("SPAWN", label=label, pid=getattr(proc, "pid", "?"), cmd=" ".join(args))
+    return proc
+
+
+def wait_launch_for_api(proc, timeout, status, label):
+    started = time.monotonic()
+    last_second = 0
+    last_process_second = -1
+    ensure_status(status, "Жду Ollama…", started)
+    while True:
+        if ollama_api_alive(log=True):
+            return True, "ok"
+        code = None
+        try:
+            code = proc.poll()
+        except Exception:
+            pass
+        if code is not None:
+            OLLAMA_EXIT_CODES.append(f"{label}: exit={code}")
+            return False, f"exit={code}"
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout:
+            OLLAMA_EXIT_CODES.append(f"{label}: timeout={int(timeout)}c")
+            return False, "timeout"
+        second = int(elapsed)
+        if second != last_second:
+            last_second = second
+            ensure_status(status, "Жду Ollama…", started)
+            if second % 5 == 0 and second != last_process_second:
+                last_process_second = second
+                procs = ollama_processes()
+                ensure_status(status, f"Процессы Ollama: {format_processes(procs)}")
+                log_event("Процессы Ollama", processes=format_processes(procs))
+        time.sleep(min(OLLAMA_POLL_INTERVAL, max(0.05, timeout - elapsed)))
+
+
+def kill_ollama_processes(status):
+    """Сначала убиваем трей, иначе app.exe сразу перезапустит serve (#14761)."""
+    procs = ollama_processes()
+    ordered = sorted(procs, key=lambda p: 0 if p.is_tray else 1)
+    for proc in ordered:
+        log_event("KILL", pid=proc.pid, name=proc.name, cmd=" ".join(proc.cmdline), source=proc.source)
+        try:
+            if psutil is not None and proc.source == "psutil":
+                real = psutil.Process(proc.pid)
+                real.terminate()
+            else:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+        except Exception as e:
+            log_event("KILL terminate failed", pid=proc.pid, error=e)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        left = ollama_processes()
+        if not left:
+            break
+        time.sleep(0.2)
+    for proc in ollama_processes():
+        log_event("KILL -9", pid=proc.pid, name=proc.name)
+        try:
+            if psutil is not None and proc.source == "psutil":
+                psutil.Process(proc.pid).kill()
+        except Exception as e:
+            log_event("KILL -9 failed", pid=proc.pid, error=e)
+    ensure_status(status, f"Перезапускаю пару процессов Ollama: {format_processes(ordered)}")
+    log_event("KILLED", pids=",".join(str(p.pid) for p in ordered))
+
+
+def wait_for_ollama(status=None, timeout=None, message="Жду Ollama…"):
+    """Опрос /api/version каждые 0.5 с; статус раз в секунду, процессы раз в 5 с."""
+    if timeout is None:
+        timeout = OLLAMA_START_TIMEOUT
+    started = time.monotonic()
+    last_second = 0
+    last_process_second = -1
+    ensure_status(status, message, started)
+    while True:
+        if ollama_api_alive(log=True):
+            return True
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout:
+            return False
+        second = int(elapsed)
+        if second != last_second:
+            last_second = second
+            ensure_status(status, message, started)
+            if second % 5 == 0 and second != last_process_second:
+                last_process_second = second
+                procs = ollama_processes()
+                ensure_status(status, f"Процессы Ollama: {format_processes(procs)}")
+                log_event("Процессы Ollama", processes=format_processes(procs))
+        time.sleep(min(OLLAMA_POLL_INTERVAL, max(0.05, timeout - elapsed)))
+
+
+def launch_ollama_sequence(status, deadline):
+    exes = find_ollama_exes()
+    log_event("Каталоги Ollama", dirs=";".join(exes["dirs"]) or "не найдены")
+    log_event("Найденные exe", exes=";".join(exes["all"]) or "не найдены")
+    ensure_status(status, f"Каталоги Ollama: {', '.join(exes['dirs']) or 'не найдены'}")
+    ensure_status(status, f"Найденные exe: {', '.join(exes['all']) or 'нет'}")
+    if not (exes["app"] or exes["cli"] or exes["server"]):
+        return False, f"Ollama не установлена: каталоги {', '.join(exes['dirs']) or 'не найдены'}."
+
+    steps = []
+    if exes["app"]:
+        steps.append(([exes["app"]], "ollama app.exe", OLLAMA_LAUNCH_STEP_TIMEOUT))
+    if exes["cli"]:
+        steps.append(([exes["cli"], "serve"], "ollama.exe serve", OLLAMA_LAUNCH_STEP_TIMEOUT))
+    if exes["server"]:
+        steps.append(([exes["server"]], "OllamaServer.exe", OLLAMA_LAUNCH_STEP_TIMEOUT))
+    if exes["cli"]:
+        steps.append(([exes["cli"], "list"], "ollama.exe list", OLLAMA_CLIENT_TIMEOUT))
+
+    for args, label, step_timeout in steps:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        step_timeout = min(step_timeout, remaining)
+        try:
+            proc = spawn_ollama_process(args, label, status)
+        except Exception as e:
+            OLLAMA_EXIT_CODES.append(f"{label}: spawn_error={e}")
+            log_event("SPAWN failed", label=label, error=e)
+            continue
+        ok, detail = wait_launch_for_api(proc, step_timeout, status, label)
+        log_event("STEP", label=label, ok=ok, detail=detail)
+        if ok:
+            return True, None
+
+    remaining = deadline - time.monotonic()
+    if remaining > 0 and wait_for_ollama(status, remaining, "Жду Ollama…"):
+        return True, None
+    return False, "все способы запуска исчерпаны"
+
+
+def ollama_model_available():
+    ok, payload, error = ollama_api_get("/api/tags", OLLAMA_API_TIMEOUT)
+    if not ok:
+        return False, False, error
+    names = []
+    if isinstance(payload, dict):
+        for item in payload.get("models", []) or []:
+            if isinstance(item, dict):
+                name = item.get("model") or item.get("name")
+                if name:
+                    names.append(str(name))
+    present = any(name.startswith(MODEL) or MODEL.startswith(name) for name in names)
+    log_event("HTTP /api/tags", present=present, models=",".join(names) or "нет")
+    return True, present, None
+
+
+def finish_ollama_success(status):
+    global MODEL_MISSING
+    ensure_status(status, "Ollama готова.")
+    api_ok, present, error = ollama_model_available()
+    MODEL_MISSING = api_ok and not present
+    if MODEL_MISSING:
+        ensure_status(status, f"Модель не скачана: выполните ollama pull {MODEL}")
+    elif api_ok:
+        ensure_status(status, f"Модель {MODEL} найдена.")
+    else:
+        log_event("/api/tags недоступен", error=error)
+    return True
+
+
+def fail_ollama(status, reason):
+    global OLLAMA_LAST_ERROR
+    OLLAMA_LAST_ERROR = with_log_path(reason)
+    OLLAMA_LAST_DETAILS.append(reason)
+    ensure_status(status, OLLAMA_LAST_ERROR)
+    log_event("ERROR", reason=reason)
+    return False
+
+
+def build_ollama_failure_reason():
+    paths = ", ".join(OLLAMA_TRIED_PATHS) or "не найдены"
+    codes = "; ".join(OLLAMA_EXIT_CODES) or "нет"
+    tail = log_tail(6) or "лог пуст"
+    return (
+        f"Не удалось запустить Ollama. Пути: {paths}. "
+        f"Коды выхода: {codes}. Stderr/лог: {tail}"
+    )
+
+
+def acquire_single_instance():
+    """Мьютекс Windows / flock на Linux: второй экземпляр не ломает первый."""
+    global SINGLE_INSTANCE_HANDLE, SINGLE_INSTANCE_FD
+    if os.environ.get("ALICE_ALLOW_MULTIPLE") == "1":
+        return True, None
+    if os.name == "nt":
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            handle = kernel32.CreateMutexW(None, 0, SINGLE_INSTANCE_NAME)
+            if not handle:
+                log_event("CreateMutexW failed", error=ctypes.get_last_error())
+                return True, None
+            if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+                return False, "Алиса уже запущена"
+            SINGLE_INSTANCE_HANDLE = handle
+            return True, None
+        except Exception as e:
+            log_event("Мьютекс недоступен", error=e)
+            return True, None
+    try:
+        import fcntl
+        path = Path("/tmp") / "alice-single-instance.lock"
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        SINGLE_INSTANCE_FD = fd
+        return True, None
+    except BlockingIOError:
+        return False, "Алиса уже запущена"
+    except Exception as e:
+        log_event("flock недоступен", error=e)
+        return True, None
+
+
 # ==================== ОБЩИЕ ПОМОЩНИКИ ====================
 def emit_status(status, text, started=None):
     """Отправляет статус; если передано начало отсчёта — добавляет таймер."""
@@ -256,20 +796,22 @@ def _field(obj, name, default=None):
 
 
 def ollama_alive():
-    """Проверяет, отвечает ли локальный сервер Ollama, с таймаутом."""
-    ok, _ = call_with_timeout(ollama.list, OLLAMA_CALL_TIMEOUT)
-    return ok
+    """Живость определяем прямым HTTP GET /api/version, а не ollama.list()."""
+    return ollama_api_alive(log=False)
 
 
 def list_models():
-    ok, resp = call_with_timeout(ollama.list, OLLAMA_CALL_TIMEOUT)
+    ok, payload, error = ollama_api_get("/api/tags", OLLAMA_API_TIMEOUT)
     if not ok:
+        log_event("/api/tags недоступен", error=error)
         return []
     names = []
-    for m in _field(resp, "models", []) or []:
-        n = _field(m, "model") or _field(m, "name")
-        if n:
-            names.append(n)
+    if isinstance(payload, dict):
+        for item in payload.get("models", []) or []:
+            if isinstance(item, dict):
+                name = item.get("model") or item.get("name")
+                if name:
+                    names.append(str(name))
     return names
 
 
@@ -373,6 +915,12 @@ def classify_command(text):
         return {"kind": "model_set", "model": model, "text": raw, "display": raw}
     if low == "/статус":
         return {"kind": "status", "text": raw, "display": raw}
+    if low in {"/старт", "/повторить", "/рестарт"}:
+        return {"kind": "restart_ollama", "text": raw, "display": raw}
+    if low == "/автозагрузка":
+        if not FEATURES["autostart"]:
+            return {"kind": "unavailable", "reason": "Настройка автозагрузки появится в следующем блоке.", "text": raw, "display": raw}
+        return {"kind": "autostart", "text": raw, "display": raw}
     if low == "/браузер":
         if not (FEATURES["deepseek"] or FEATURES["vk_music"]):
             return {"kind": "unavailable", "reason": "Настройка браузера появится в следующем блоке.", "text": raw, "display": raw}
@@ -416,11 +964,16 @@ def state_word(state):
 
 
 def status_text(history_len=0, ollama="warn", model="warn", browser="warn"):
-    return (
+    text = (
         f"Алиса {ALICE_VERSION}. Модель: {MODEL} ({state_word(model)}). "
         f"Ollama: {state_word(ollama)}. Браузер: {state_word(browser)}. "
         f"История: {history_len} сообщений."
     )
+    if model == "warn" and MODEL_MISSING:
+        text += f" Модель не скачана: выполните ollama pull {MODEL}."
+    if ollama == "err" and OLLAMA_LAST_ERROR:
+        text += f" {OLLAMA_LAST_ERROR}"
+    return text
 
 
 def playwright_available():
@@ -432,9 +985,11 @@ def playwright_available():
 
 def health_snapshot(history_len=0, browser_override=None):
     """Один снимок здоровья для индикаторов и /статус."""
-    ollama_ok = ollama_alive()
+    global MODEL_MISSING
+    ollama_ok = ollama_api_alive(log=False)
     models = list_models() if ollama_ok else []
     model_ok = any(m.startswith(MODEL) or MODEL.startswith(m) for m in models)
+    MODEL_MISSING = ollama_ok and not model_ok
     if browser_override == "err":
         browser_state = "err"
     elif playwright_available() and BROWSER_PROFILE.exists():
@@ -451,7 +1006,13 @@ def health_snapshot(history_len=0, browser_override=None):
     return states, status_text(history_len, **states)
 
 
-# ==================== АВТОЗАПУСК OLLAMA ====================
+# ==================== НАДЁЖНЫЙ ЗАПУСК OLLAMA ====================
+PORT_BUSY_ERROR = (
+    "Порт 11434 занят, но Ollama не отвечает — перезапусти Ollama "
+    "(или нажми Повторить)"
+)
+
+
 def ollama_env():
     """Env для запускаемого сервера: настройки передаём явно, не из профиля."""
     env = os.environ.copy()
@@ -460,84 +1021,182 @@ def ollama_env():
     return env
 
 
-def start_ollama_windows(env, status):
-    """Windows: сначала скрытый ollama serve, запасной вариант — ollama app.exe."""
-    local = os.environ.get("LOCALAPPDATA")
-    serve = None
-    if local:
-        candidate = Path(local) / "Programs" / "Ollama" / "ollama.exe"
-        if candidate.exists():
-            serve = str(candidate)
-    if serve is None:
-        serve = shutil.which("ollama")
-
-    if serve:
-        try:
-            startupinfo = None
-            creationflags = 0
-            if os.name == "nt":
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = subprocess.SW_HIDE
-                creationflags = subprocess.CREATE_NO_WINDOW
-            subprocess.Popen(
-                [serve, "serve"],
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                startupinfo=startupinfo,
-                creationflags=creationflags,
-                close_fds=True,
-            )
-            emit_status(status, "Запускаю Ollama скрытым процессом ollama serve…")
-            return True
-        except Exception as e:
-            emit_status(status, f"Не удалось запустить ollama serve: {e}. Пробую запасной вариант.")
-
-    app = Path(local) / "Programs" / "Ollama" / "ollama app.exe" if local else None
-    if app is not None and app.exists():
-        try:
-            subprocess.Popen([str(app)], env=env, close_fds=True)
-            emit_status(status, "Запустила запасной ollama app.exe.")
-            return True
-        except Exception as e:
-            emit_status(status, f"Не удалось запустить ollama app.exe: {e}.")
-    else:
-        emit_status(status, "Не нашла ни ollama.exe, ни ollama app.exe.")
-    return False
-
-
-def wait_for_ollama(status=None, timeout=None):
-    if timeout is None:
-        timeout = OLLAMA_START_TIMEOUT
-    return poll_until(ollama_alive, timeout, status, "Запускаю Ollama…", interval=1.0)
-
-
 def ensure_ollama(status=print, timeout=None):
-    """Проверяет Ollama и при необходимости поднимает её скрытым процессом."""
+    """
+    Единый алгоритм для GUI, --text и --voice.
+
+    Учитывает баги Windows-сборки Ollama:
+    - #12691: ollama app.exe в трее есть, а ollama.exe serve не поднялся;
+    - #14761: app.exe сам перезапускает serve, поэтому убивать надо пару.
+    """
+    global OLLAMA_LAST_ERROR
     if timeout is None:
         timeout = OLLAMA_START_TIMEOUT
-    if ollama_alive():
-        emit_status(status, "Ollama: ок.")
-        emit_status(status, "Ollama готова.")
-        return True
+    OLLAMA_LAST_ERROR = ""
+    OLLAMA_LAST_DETAILS.clear()
+    OLLAMA_TRIED_PATHS.clear()
+    OLLAMA_EXIT_CODES.clear()
+    log_event("ENSURE START", timeout=timeout, model=MODEL)
 
-    emit_status(status, "Ollama не отвечает. Запускаю её сама...")
+    ensure_status(status, "Проверяю Ollama: HTTP /api/version…")
+    ok, payload, error = ollama_api_get("/api/version", OLLAMA_API_TIMEOUT)
+    if ok:
+        log_event("HTTP OK", version=payload)
+        ensure_status(status, "Ollama: ок (HTTP API отвечает).")
+        ensure_status(status, "Лишние процессы не запускаю.")
+        return finish_ollama_success(status)
+
+    log_event("HTTP FAIL", error=error)
+    ensure_status(status, "Ollama API не отвечает. Смотрю процессы…")
+    procs = ollama_processes()
+    ensure_status(status, f"Процессы Ollama: {format_processes(procs)}")
+    log_event("Процессы Ollama", processes=format_processes(procs))
+
+    if procs:
+        ensure_status(status, "Ollama запущена, но API не отвечает. Жду 10 сек…")
+        if wait_for_ollama(status, OLLAMA_BUG_WAIT, "Жду Ollama…"):
+            return finish_ollama_success(status)
+        ensure_status(
+            status,
+            "Ollama запущена, но сервер не отвечает (известный баг #12691) — перезапускаю",
+        )
+        kill_ollama_processes(status)
+
+    if port_in_use() and not ollama_api_alive(log=True):
+        return fail_ollama(status, PORT_BUSY_ERROR)
+
+    launch_deadline = time.monotonic() + timeout
+    launched, detail = launch_ollama_sequence(status, launch_deadline)
+    if launched or ollama_api_alive(log=True):
+        return finish_ollama_success(status)
+
+    if port_in_use():
+        return fail_ollama(status, PORT_BUSY_ERROR)
+    log_event("ENSURE FAIL", detail=detail)
+    return fail_ollama(status, build_ollama_failure_reason())
+
+
+def windows_startup_folder():
+    """Папка shell:startup. COM, если есть pywin32; иначе стандартный путь."""
+    try:
+        import win32com.client
+        shell = win32com.client.Dispatch("WScript.Shell")
+        folder = shell.SpecialFolders("Startup")
+        if folder:
+            return Path(str(folder))
+    except Exception as e:
+        log_event("COM WScript.Shell недоступен", error=e)
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    return Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
+def read_shortcut_target(lnk):
+    try:
+        import win32com.client
+        shell = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortcut(str(lnk))
+        return str(getattr(shortcut, "TargetPath", "") or "")
+    except Exception as e:
+        log_event("Не удалось прочитать ярлык", path=lnk, error=e)
+        return ""
+
+
+def create_shortcut_com(app, lnk):
+    import win32com.client
+    shell = win32com.client.Dispatch("WScript.Shell")
+    shortcut = shell.CreateShortcut(str(lnk))
+    shortcut.TargetPath = str(app)
+    shortcut.WorkingDirectory = str(Path(app).parent)
+    shortcut.Description = "Ollama — локальный сервер для Алисы"
+    shortcut.Save()
+    return shortcut
+
+
+def create_shortcut_powershell(app, lnk):
+    """Официальный рецепт WScript.Shell через powershell.exe без pywin32."""
+    script = (
+        f'$s=(New-Object -ComObject WScript.Shell).CreateShortcut("{lnk}"); '
+        f'$s.TargetPath="{app}"; '
+        f'$s.WorkingDirectory="{Path(app).parent}"; '
+        '$s.Save()'
+    )
+    kwargs = dict(
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        **kwargs,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"PowerShell exit={result.returncode}: "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+    return result
+
+
+def autostart_ollama():
+    """
+    Создаёт/проверяет ярлык shell:startup строго на ollama app.exe.
+    Ярлык на CLI ollama.exe — типичная причина «стоит в автозагрузке, но не работает».
+    """
     if os.name != "nt":
-        emit_status(status, "Автозапуск настроен для Windows. Запусти Ollama вручную.")
-        return False
+        return False, "Автозагрузка настраивается только в Windows."
 
-    if not start_ollama_windows(ollama_env(), status):
-        emit_status(status, "Не удалось запустить Ollama. Запусти её вручную и перезапусти Алису.")
-        return False
+    exes = find_ollama_exes()
+    app = exes["app"]
+    if not app:
+        dirs = ", ".join(exes["dirs"]) or "не найдены"
+        return False, f"Ollama не установлена: каталоги {dirs}."
+    if "app" not in Path(app).name.lower():
+        return False, f"Ollama не установлена: не найден ollama app.exe среди {', '.join(exes['all'])}."
 
-    if wait_for_ollama(status, timeout):
-        emit_status(status, "Ollama готова.")
-        return True
+    startup = windows_startup_folder()
+    startup.mkdir(parents=True, exist_ok=True)
+    lnk = startup / "Ollama.lnk"
+    log_event("AUTOSTART", app=app, shortcut=lnk, startup=startup)
 
-    emit_status(status, "Ollama не ответила вовремя. Проверь, что она запущена, и перезапусти Алису.")
-    return False
+    if lnk.exists():
+        target = read_shortcut_target(lnk)
+        if target and Path(target).name.lower() == Path(app).name.lower():
+            return True, f"Ярлык уже есть: {lnk}"
+        log_event("Ярлык указывает не туда", current=target, expected=app)
+
+    try:
+        create_shortcut_com(app, lnk)
+        method = "pywin32 COM"
+    except Exception as e:
+        log_event("COM-создание ярлыка не удалось", error=e)
+        try:
+            create_shortcut_powershell(app, lnk)
+            method = "PowerShell WScript.Shell"
+        except Exception as e2:
+            log_event("PowerShell-создание ярлыка не удалось", error=e2)
+            return False, f"Не удалось создать ярлык автозагрузки: {e2}"
+    log_event("Ярлык создан", method=method, target=app, path=lnk)
+    return True, f"Ярлык создан: {lnk}"
+
+
+def restart_ollama_in_background(status=print):
+    """Команда /старт: повторяет ensure, не блокируя консоль/голос."""
+    status("Повторяю запуск Ollama в фоне…")
+    log_event("RESTART /старт")
+
+    def runner():
+        try:
+            ensure_ollama(status)
+        except Exception as e:
+            fail_ollama(status, f"Ошибка при повторном запуске Ollama: {e}")
+
+    threading.Thread(target=runner, daemon=True).start()
 
 
 # ==================== БРАУЗЕР АССИСТЕНТА (Playwright) ====================
@@ -937,7 +1596,9 @@ class ConsoleBrowser:
 # ==================== ТЕКСТОВЫЙ РЕЖИМ ====================
 def command_hint():
     """Подсказка только по включённым на этом этапе возможностям."""
-    parts = ["/модель", "/модель <имя>", "/статус"]
+    parts = ["/модель", "/модель <имя>", "/статус", "/старт"]
+    if FEATURES["autostart"]:
+        parts.append("/автозагрузка")
     if FEATURES["deepseek"]:
         parts.append("д: <вопрос>")
     if FEATURES["vk_music"]:
@@ -952,7 +1613,8 @@ def main_text():
     global MODEL
     print(f"Алиса {ALICE_VERSION} (текст) | модель: {MODEL} | контекст: {NUM_CTX}")
     print(f"Команды: {command_hint()}\n")
-    ensure_ollama(print)
+    if not ensure_ollama(print):
+        print(f"Система: {OLLAMA_LAST_ERROR or with_log_path('Ollama недоступна.')}")
     browser = ConsoleBrowser(print)
     history = [{"role": "system", "content": SYSTEM}]
 
@@ -989,6 +1651,13 @@ def main_text():
         if kind == "status":
             _states, text_out = health_snapshot(len(history) - 1)
             print(text_out)
+            continue
+        if kind == "restart_ollama":
+            restart_ollama_in_background(print)
+            continue
+        if kind == "autostart":
+            ok, response = autostart_ollama()
+            print(("Система: " if not ok else "") + response)
             continue
         if kind == "unavailable":
             print(f"Система: {intent['reason']}")
@@ -1134,7 +1803,8 @@ def main_voice():
         print("Выполни:  pip install faster-whisper piper-tts sounddevice numpy")
         return 1
 
-    ensure_ollama(print)
+    if not ensure_ollama(print):
+        print(f"Система: {OLLAMA_LAST_ERROR or with_log_path('Ollama недоступна.')}")
     browser = ConsoleBrowser(print)
 
     onnx = find_voice(VOICE_NAME)
@@ -1184,6 +1854,16 @@ def main_voice():
             _states, text_out = health_snapshot(len(history) - 1)
             print(text_out)
             say(tts_voice, "Статус в консоли.")
+            continue
+        if kind == "restart_ollama":
+            print("Повторяю запуск Ollama в фоне…")
+            say(tts_voice, "Повторяю запуск Олламы.")
+            restart_ollama_in_background(print)
+            continue
+        if kind == "autostart":
+            ok, response = autostart_ollama()
+            print(f"Система: {response}")
+            say(tts_voice, response)
             continue
         if kind == "unavailable":
             print(f"Система: {intent['reason']}")
@@ -1375,6 +2055,8 @@ def main_gui():
             self.browser_worker = None
             self.voice_thread = None
             self.voice_worker = None
+            self.autostart_thread = None
+            self.autostart_worker = None
 
             central = QWidget(self)
             self.setCentralWidget(central)
@@ -1425,6 +2107,12 @@ def main_gui():
                 self.browser_button.clicked.connect(self.open_browser_setup)
                 row.addWidget(self.browser_button)
                 self.action_buttons.append(self.browser_button)
+
+            self.retry_button = QPushButton("Повторить", self)
+            self.retry_button.setToolTip("Повторить запуск Ollama (/старт)")
+            self.retry_button.clicked.connect(self.start_ollama_check)
+            row.addWidget(self.retry_button)
+            self.action_buttons.append(self.retry_button)
 
             if FEATURES["voice_gui"]:
                 self.mic_button = QPushButton("🎙", self)
@@ -1544,6 +2232,20 @@ def main_gui():
                     "Ищу в VK Музыке",
                     "Открой VK",
                     "Окно браузера ассистента открыто",
+                    "Проверяю Ollama",
+                    "Ollama API не отвечает",
+                    "Процессы Ollama",
+                    "Запускаю ollama app.exe",
+                    "Запускаю ollama.exe serve",
+                    "Запускаю OllamaServer.exe",
+                    "Запускаю ollama.exe list",
+                    "Жду Ollama",
+                    "Ollama запущена, но сервер",
+                    "Каталоги Ollama",
+                    "Найденные exe",
+                    "Модель не скачана",
+                    "Порт 11434 занят",
+                    "Не удалось запустить Ollama",
                 ) if text.startswith(prefix)
             ), None)
             if key and key not in self.important_statuses:
@@ -1554,6 +2256,9 @@ def main_gui():
 
         # ---------- Ollama ----------
         def start_ollama_check(self):
+            if self.busy and self.startup_worker is not None:
+                return
+            self.clear_live_status()
             self.set_busy(True, "Проверяю Ollama...")
             thread = QThread(self)
             worker = StartupWorker()
@@ -1572,12 +2277,17 @@ def main_gui():
         def on_startup_done(self, ok):
             self.clear_live_status()
             self.ollama_ready = ok
+            self.startup_worker = None
             if ok:
                 self.append_status("Ollama готова. Можно писать.")
+                if MODEL_MISSING:
+                    self.append_status(f"Модель не скачана: выполните ollama pull {MODEL}")
+                    self.update_indicator(self.model_indicator, "Модель", "warn")
                 self.set_busy(False, "Ollama: ок")
             else:
-                self.append_error("Ollama недоступна. Запусти её вручную и перезапусти Алису.")
+                self.append_error(OLLAMA_LAST_ERROR or with_log_path("Ollama недоступна."))
                 self.set_busy(False, "Ollama: ошибка")
+            self.start_health_check()
 
         # ---------- здоровье ----------
         def update_indicator(self, label, name, state):
@@ -1767,6 +2477,15 @@ def main_gui():
                 self.append_status(self.health_text or status_text(len(self.history) - 1, **self.health))
                 self.start_health_check()
                 return
+            if kind == "restart_ollama":
+                self.append_user(display)
+                self.append_status("Повторяю запуск Ollama в фоне…")
+                self.start_ollama_check()
+                return
+            if kind == "autostart":
+                self.append_user(display)
+                self.start_autostart()
+                return
             if kind == "browser_setup":
                 self.append_user(display)
                 self.start_browser_intent(intent)
@@ -1786,6 +2505,32 @@ def main_gui():
             self.append_error("Не поняла команду.")
 
         # ---------- голосовая кнопка ----------
+        def start_autostart(self):
+            if self.busy:
+                return
+            self.clear_live_status()
+            self.set_busy(True, "Настраиваю автозагрузку…")
+            thread = QThread(self)
+            worker = FunctionWorker(lambda: autostart_ollama()[1])
+            worker.completed.connect(self.on_autostart_result)
+            worker.completed.connect(thread.quit)
+            worker.completed.connect(worker.deleteLater)
+            thread.started.connect(worker.run)
+            thread.finished.connect(thread.deleteLater)
+            self.autostart_thread = thread
+            self.autostart_worker = worker
+            thread.start()
+
+        @Slot(str, bool)
+        def on_autostart_result(self, text, ok):
+            self.clear_live_status()
+            self.autostart_worker = None
+            if ok:
+                self.append_status(text)
+            else:
+                self.append_error(with_log_path(text))
+            self.set_busy(False, "Готово" if ok else "Автозагрузка")
+
         def start_voice_capture(self):
             if self.busy:
                 return
@@ -1883,12 +2628,27 @@ def main():
     args = ap.parse_args()
     if args.model:
         MODEL = args.model
+    single_ok, single_message = acquire_single_instance()
+    if not single_ok:
+        print(single_message)
+        log_event("Второй экземпляр", detail=single_message)
+        if not (args.text or args.voice):
+            try:
+                from PySide6.QtWidgets import QApplication, QMessageBox
+                app = QApplication.instance() or QApplication(sys.argv)
+                QMessageBox.warning(None, "Алиса", single_message)
+                del app
+            except Exception:
+                pass
+        return 1
     if args.text:
         return main_text()
     elif args.voice:
         return main_voice()
     return main_gui()
 
+
+init_log()
 
 if __name__ == "__main__":
     try:
