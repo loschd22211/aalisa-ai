@@ -4,3 +4,4 @@ piper-tts
 sounddevice
 numpy
 PySide6
+playwright
