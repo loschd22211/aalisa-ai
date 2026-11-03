@@ -13,6 +13,7 @@
 """
 
 import argparse
+import contextlib
 import ctypes
 import functools
 import html
@@ -144,6 +145,15 @@ SINGLE_INSTANCE_HANDLE = None
 SINGLE_INSTANCE_FD = None
 GUI_WINDOW = None
 CONSOLE_LAST = {}
+
+# Ограничение показываемых ошибок: без этого сломанный вывод в ленту затапливает консоль и лог.
+ERROR_STATE = {}
+ERROR_STATE_LOCK = threading.RLock()
+ERROR_CONSOLE_LIMIT = 20
+ERROR_CONSOLE_INTERVAL = 5.0
+ERROR_DISPLAY_DEPTH = 0
+ERROR_DISPLAY_LOCK = threading.Lock()
+ERROR_DISPLAY_METHODS = frozenset({"append_error", "on_global_error"})
 
 # Архитектурные заготовки: НЕ реализованы в этой итерации.
 FUTURE_HOOKS = {
@@ -284,17 +294,27 @@ def log_path_text():
         return str(LOG_PATH)
 
 
-def init_log():
-    """Создаёт каталог лога и обрезает старый файл до ~1 МБ при запуске."""
+def rotate_log_if_needed():
+    """Держит alice.log около LOG_MAX_BYTES даже при шквале повторов."""
     try:
         path = alice_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+            size = path.stat().st_size
             keep = LOG_MAX_BYTES // 2
             with path.open("rb") as f:
-                f.seek(max(0, path.stat().st_size - keep))
+                f.seek(max(0, size - keep))
                 tail = f.read()
-            path.write_bytes(b"... log truncated ...\n" + tail)
+            path.write_bytes(b"... log rotated ...\n" + tail)
+    except Exception:
+        pass
+
+
+def init_log():
+    """Создаёт каталог лога и обрезает старый файл до ~1 МБ при запуске."""
+    try:
+        rotate_log_if_needed()
+        path = alice_log_path()
         with path.open("a", encoding="utf-8") as f:
             f.write(f"=== Алиса {ALICE_VERSION} запущена: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
     except Exception as e:
@@ -302,6 +322,7 @@ def init_log():
 
 
 def log_event(message, **fields):
+    rotate_log_if_needed()
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}"
     for key, value in fields.items():
         if value not in (None, "", [], {}):
@@ -335,6 +356,99 @@ def console_key(text):
     return re.sub(r"\s*\(\d+\s*c\)", "", text).strip()
 
 
+def error_key(text, place=None):
+    """Ключ дедупликации: нормализованный текст + место возникновения."""
+    normalized = console_key(str(text))
+    return f"{place or 'error'}:{normalized}" if place else normalized
+
+
+def _error_state(key):
+    return ERROR_STATE.setdefault(key, {
+        "count": 0,
+        "console_shown": 0,
+        "last_console": -1e9,
+        "last_reported": 0,
+        "feed_shown": False,
+    })
+
+
+def error_feed_allowed(key):
+    """Одинаковая ошибка рисуется в ленте ровно один раз за сессию."""
+    with ERROR_STATE_LOCK:
+        state = _error_state(key)
+        if state["feed_shown"]:
+            return False
+        state["feed_shown"] = True
+        return True
+
+
+def error_display_active():
+    with ERROR_DISPLAY_LOCK:
+        return ERROR_DISPLAY_DEPTH > 0
+
+
+@contextlib.contextmanager
+def error_display_guard():
+    """Показ ошибки: любые вложенные исключения НЕ должны снова пытаться писать в ленту."""
+    global ERROR_DISPLAY_DEPTH
+    with ERROR_DISPLAY_LOCK:
+        ERROR_DISPLAY_DEPTH += 1
+    try:
+        yield
+    finally:
+        with ERROR_DISPLAY_LOCK:
+            ERROR_DISPLAY_DEPTH = max(0, ERROR_DISPLAY_DEPTH - 1)
+
+
+def console_log_error(message, key=None, trace=None, origin=None):
+    """Консоль/лог для ошибок: дедуп, «×N повторов», потолок 20 строк одного типа."""
+    try:
+        key = key or error_key(message, origin)
+        now = time.monotonic()
+        with ERROR_STATE_LOCK:
+            state = _error_state(key)
+            state["count"] += 1
+            count = state["count"]
+            if state["console_shown"] >= ERROR_CONSOLE_LIMIT:
+                log_event("ERROR SUPPRESSED", key=key, count=count, detail=message)
+                return False
+            if count == 1:
+                if trace:
+                    print(trace, file=sys.stderr, flush=True)
+                console_log(str(message), level="ERROR")
+                log_event(
+                    "EXCEPTION" if trace else "ERROR",
+                    origin=origin, detail=message, traceback=trace,
+                )
+                state["console_shown"] = 1
+                state["last_console"] = now
+                state["last_reported"] = 1
+                return True
+            if now - state["last_console"] < ERROR_CONSOLE_INTERVAL:
+                log_event("ERROR REPEAT SUPPRESSED", key=key, count=count)
+                return False
+            repeats = count - state["last_reported"]
+            line = f"{message} ×{repeats} повторов"
+            console_log(line, level="ERROR")
+            log_event("ERROR REPEAT", key=key, repeats=repeats, detail=message)
+            state["console_shown"] += 1
+            state["last_console"] = now
+            state["last_reported"] = count
+            return True
+    except Exception:
+        return False
+
+
+def report_feed_failure(exc, where="_feed_append_html"):
+    """Падение самого вывода в ленту: только консоль + лог, без новой попытки GUI."""
+    try:
+        trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        text = f"Не удалось вывести строку в ленту ({where}): {exc}. Подробности: {log_path_text()}"
+        console_log_error(text, key=error_key(text, where), trace=trace, origin="feed")
+    except Exception:
+        pass
+
+
 def install_warning_hooks():
     """Python-warnings идут в консоль и лог, а не теряются."""
     def showwarning(message, category, filename, lineno, file=None, line=None):
@@ -348,14 +462,19 @@ def install_warning_hooks():
 
 
 def report_exception(exc_type, exc, tb, origin="приложение"):
-    """Общий обработчик: traceback в консоль/лог + красная строка в GUI."""
+    """Общий обработчик: traceback в консоль/лог + одна красная строка в GUI."""
     try:
         trace = "".join(traceback.format_exception(exc_type, exc, tb))
         short = f"Перехвачена ошибка ({origin}): {exc}. Подробности: {log_path_text()}"
-        print(trace, file=sys.stderr, flush=True)
-        console_log(short, level="ERROR")
-        log_event("EXCEPTION", origin=origin, traceback=trace)
-        if GUI_WINDOW is not None and "on_global_error" not in origin:
+        console_log_error(short, key=error_key(short), trace=trace, origin=origin)
+        # Внутри показа ошибки не испускаем error_signal: иначе append_error -> report -> append_error.
+        if (
+            GUI_WINDOW is not None
+            and not error_display_active()
+            and "on_global_error" not in origin
+            and "append_error" not in origin
+            and "feed" not in origin
+        ):
             try:
                 GUI_WINDOW.error_signal.emit(short)
             except Exception:
@@ -2055,11 +2174,17 @@ def main_gui():
                     return None
             except Exception:
                 pass
-            try:
-                return fn(self, *args, **kwargs)
-            except Exception:
-                report_exception(*sys.exc_info(), origin=f"слот {fn.__name__}")
-                return None
+            guard = (
+                error_display_guard()
+                if fn.__name__ in ERROR_DISPLAY_METHODS
+                else contextlib.nullcontext()
+            )
+            with guard:
+                try:
+                    return fn(self, *args, **kwargs)
+                except Exception:
+                    report_exception(*sys.exc_info(), origin=f"слот {fn.__name__}")
+                    return None
         return wrapper
 
     class StartupWorker(QObject):
@@ -2201,6 +2326,7 @@ def main_gui():
             self.important_statuses = set()
             self.assistant_open = False
             self.live_marker = None
+            self._error_display_depth = 0
             self.first_local_request = True
             self.browser_health = None
             self.health = {"ollama": "warn", "model": "warn", "browser": "warn"}
@@ -2310,12 +2436,41 @@ def main_gui():
         @Slot(str)
         @gui_only
         def on_global_error(self, message):
-            self.append_error(message)
-            self.set_busy(False, "Ошибка перехвачена")
-            self.input.setEnabled(True)
-            self.input.setFocus()
+            try:
+                self.append_error(message, source="report_exception")
+            finally:
+                self.set_busy(False, "Ошибка перехвачена")
+                self.input.setEnabled(True)
+                self.input.setFocus()
 
         # ---------- лента ----------
+        def _feed_append_html(self, html_text, newline=True, live=False):
+            """Единственная точка вставки в QTextEdit: moveCursor + insertHtml + append('')."""
+            try:
+                if live:
+                    cursor = self.chat.textCursor()
+                    cursor.movePosition(QTextCursor.End)
+                    if self.live_marker is not None:
+                        cursor.setPosition(self.live_marker, QTextCursor.MoveAnchor)
+                        cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+                        cursor.removeSelectedText()
+                    else:
+                        self.live_marker = cursor.position() + 1
+                self.chat.moveCursor(QTextCursor.End)
+                self.chat.insertHtml(html_text)
+                if newline:
+                    self.chat.append("")
+                self.scroll_down()
+            except Exception as e:
+                # QTextEdit.insertHtml может отсутствовать/упасть; append(str) — корректный fallback.
+                try:
+                    plain = re.sub(r"<[^>]+>", "", str(html_text))
+                    self.chat.append(plain)
+                    self.live_marker = None
+                    self.scroll_down()
+                except Exception as e2:
+                    report_feed_failure(e2, "_feed_append_html")
+
         @gui_only
         def clear_live_status(self):
             self.live_marker = None
@@ -2328,74 +2483,67 @@ def main_gui():
                 key=console_key(text),
                 min_interval=5.0,
             )
-            try:
-                cursor = self.chat.textCursor()
-                cursor.movePosition(QTextCursor.End)
-                if self.live_marker is None:
-                    self.live_marker = cursor.position() + 1
-                    self.chat.append(f"Система: {text}")
-                else:
-                    cursor.setPosition(self.live_marker, QTextCursor.MoveAnchor)
-                    cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
-                    cursor.removeSelectedText()
-                    cursor.insertText(f"Система: {text}")
-            except Exception:
-                self.chat.append(f"Система: {text}")
-                self.live_marker = None
-            self.scroll_down()
+            self._feed_append_html(
+                f"Система: {html.escape(str(text))}", newline=True, live=True
+            )
 
         @Slot(str)
         @gui_only
         def append_status(self, text):
             console_log(text, level="INFO", key=console_key(text), min_interval=1.0)
             self.clear_live_status()
-            self.chat.append(f"Система: {text}")
-            self.scroll_down()
+            self._feed_append_html(f"Система: {html.escape(str(text))}")
 
         @gui_only
-        def append_error(self, text):
-            console_log(text, level="ERROR", key=console_key(text), min_interval=1.0)
-            self.clear_live_status()
-            self.chat.appendHtml(
-                f'<span style="color:#ff6b6b;">Система: {html.escape(text)}</span>'
-            )
-            self.scroll_down()
+        def append_error(self, text, source=None):
+            message = str(text)
+            key = error_key(message)
+            console_log_error(message, key=key, origin=source)
+            # Повторный заход в показ ошибки не трогает ленту: только консоль + лог.
+            if self._error_display_depth:
+                return
+            if not error_feed_allowed(key):
+                return
+            self._error_display_depth += 1
+            try:
+                self.clear_live_status()
+                self._feed_append_html(
+                    f'<span style="color:#ff6b6b;">Система: {html.escape(message)}</span>'
+                )
+            except Exception:
+                report_exception(*sys.exc_info(), origin="показ ошибки в ленте")
+            finally:
+                self._error_display_depth -= 1
 
         @gui_only
         def append_user(self, text):
             console_log(f"Ты: {text}", level="USER")
             self.clear_live_status()
-            self.chat.append(f"Ты: {text}")
-            self.scroll_down()
+            self._feed_append_html(f"Ты: {html.escape(str(text))}")
 
         @gui_only
         def append_deepseek(self, text):
             console_log(f"DeepSeek: {text}", level="WEB")
             self.clear_live_status()
-            self.chat.append(f"DeepSeek: {text}")
-            self.scroll_down()
+            self._feed_append_html(f"DeepSeek: {html.escape(str(text))}")
 
         @gui_only
         def begin_assistant(self):
             self.clear_live_status()
-            self.chat.append("Алиса: ")
+            self._feed_append_html("Алиса: ", newline=False)
             self.assistant_open = True
-            self.scroll_down()
 
         @gui_only
         def finish_assistant(self):
             if self.assistant_open:
-                self.chat.append("")
+                self._feed_append_html("", newline=True)
                 self.assistant_open = False
-                self.scroll_down()
 
         @Slot(str)
         @gui_only
         def append_chunk(self, chunk):
             self.clear_live_status()
-            self.chat.moveCursor(QTextCursor.End)
-            self.chat.insertPlainText(chunk)
-            self.scroll_down()
+            self._feed_append_html(html.escape(str(chunk)), newline=False)
 
         @gui_only
         def scroll_down(self):
