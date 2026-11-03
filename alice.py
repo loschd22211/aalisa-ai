@@ -107,7 +107,7 @@ FEATURES = {
     "vk_music": True,
     "status_bar": True,
     "voice_gui": True,
-    "autostart": False,               # блок 2: /автозагрузка и README
+    "autostart": True,                # /автозагрузка и README настроены
 }
 
 OLLAMA_LAST_ERROR = ""
@@ -1076,9 +1076,113 @@ def ensure_ollama(status=print, timeout=None):
     return fail_ollama(status, build_ollama_failure_reason())
 
 
+def windows_startup_folder():
+    """Папка shell:startup. COM, если есть pywin32; иначе стандартный путь."""
+    try:
+        import win32com.client
+        shell = win32com.client.Dispatch("WScript.Shell")
+        folder = shell.SpecialFolders("Startup")
+        if folder:
+            return Path(str(folder))
+    except Exception as e:
+        log_event("COM WScript.Shell недоступен", error=e)
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    return Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
+def read_shortcut_target(lnk):
+    try:
+        import win32com.client
+        shell = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortcut(str(lnk))
+        return str(getattr(shortcut, "TargetPath", "") or "")
+    except Exception as e:
+        log_event("Не удалось прочитать ярлык", path=lnk, error=e)
+        return ""
+
+
+def create_shortcut_com(app, lnk):
+    import win32com.client
+    shell = win32com.client.Dispatch("WScript.Shell")
+    shortcut = shell.CreateShortcut(str(lnk))
+    shortcut.TargetPath = str(app)
+    shortcut.WorkingDirectory = str(Path(app).parent)
+    shortcut.Description = "Ollama — локальный сервер для Алисы"
+    shortcut.Save()
+    return shortcut
+
+
+def create_shortcut_powershell(app, lnk):
+    """Официальный рецепт WScript.Shell через powershell.exe без pywin32."""
+    script = (
+        f'$s=(New-Object -ComObject WScript.Shell).CreateShortcut("{lnk}"); '
+        f'$s.TargetPath="{app}"; '
+        f'$s.WorkingDirectory="{Path(app).parent}"; '
+        '$s.Save()'
+    )
+    kwargs = dict(
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        **kwargs,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"PowerShell exit={result.returncode}: "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+    return result
+
+
 def autostart_ollama():
-    """Заглушка блока 1; в блоке 2 заменяется созданием .lnk."""
-    return False, "Команда /автозагрузка появится в следующем блоке."
+    """
+    Создаёт/проверяет ярлык shell:startup строго на ollama app.exe.
+    Ярлык на CLI ollama.exe — типичная причина «стоит в автозагрузке, но не работает».
+    """
+    if os.name != "nt":
+        return False, "Автозагрузка настраивается только в Windows."
+
+    exes = find_ollama_exes()
+    app = exes["app"]
+    if not app:
+        dirs = ", ".join(exes["dirs"]) or "не найдены"
+        return False, f"Ollama не установлена: каталоги {dirs}."
+    if "app" not in Path(app).name.lower():
+        return False, f"Ollama не установлена: не найден ollama app.exe среди {', '.join(exes['all'])}."
+
+    startup = windows_startup_folder()
+    startup.mkdir(parents=True, exist_ok=True)
+    lnk = startup / "Ollama.lnk"
+    log_event("AUTOSTART", app=app, shortcut=lnk, startup=startup)
+
+    if lnk.exists():
+        target = read_shortcut_target(lnk)
+        if target and Path(target).name.lower() == Path(app).name.lower():
+            return True, f"Ярлык уже есть: {lnk}"
+        log_event("Ярлык указывает не туда", current=target, expected=app)
+
+    try:
+        create_shortcut_com(app, lnk)
+        method = "pywin32 COM"
+    except Exception as e:
+        log_event("COM-создание ярлыка не удалось", error=e)
+        try:
+            create_shortcut_powershell(app, lnk)
+            method = "PowerShell WScript.Shell"
+        except Exception as e2:
+            log_event("PowerShell-создание ярлыка не удалось", error=e2)
+            return False, f"Не удалось создать ярлык автозагрузки: {e2}"
+    log_event("Ярлык создан", method=method, target=app, path=lnk)
+    return True, f"Ярлык создан: {lnk}"
 
 
 def restart_ollama_in_background(status=print):
