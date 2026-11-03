@@ -14,6 +14,7 @@
 
 import argparse
 import ctypes
+import functools
 import html
 import importlib.util
 import json
@@ -26,6 +27,8 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
+import warnings
 import urllib.error
 import urllib.request
 import wave
@@ -53,18 +56,39 @@ try:
 except Exception:
     psutil = None
 
-# Голосовой стек может отсутствовать — окно и консоль всё равно работают.
-try:
-    import numpy as np
-    import sounddevice as sd
-    import winsound
-    from faster_whisper import WhisperModel
-    from piper import PiperVoice
-    VOICE_OK = True
-    VOICE_ERR = None
-except Exception as _e:
-    VOICE_OK = False
-    VOICE_ERR = _e
+# Голосовой стек загружается ТОЛЬКО по кнопке 🎙 или в --voice.
+# Ранний import faster_whisper вызывал предупреждение HF Hub сразу при старте GUI.
+VOICE_OK = None                 # None = ещё не загружали, True/False = результат
+VOICE_ERR = None
+VOICE_STACK = {}
+
+
+def load_voice_stack(need_stt=False, need_tts=False, status=None):
+    """Лениво подгружает numpy/sounddevice/faster_whisper/piper по требованию."""
+    global VOICE_OK, VOICE_ERR
+    if VOICE_OK is False:
+        return False
+    try:
+        if "np" not in VOICE_STACK:
+            import numpy as np
+            import sounddevice as sd
+            import winsound
+            VOICE_STACK.update(np=np, sd=sd, winsound=winsound)
+        if need_stt and "WhisperModel" not in VOICE_STACK:
+            emit_status(status, "Грузим распознавание речи…")
+            from faster_whisper import WhisperModel
+            VOICE_STACK["WhisperModel"] = WhisperModel
+        if need_tts and "PiperVoice" not in VOICE_STACK:
+            from piper import PiperVoice
+            VOICE_STACK["PiperVoice"] = PiperVoice
+        VOICE_OK = True
+        VOICE_ERR = None
+        return True
+    except Exception as e:
+        VOICE_OK = False
+        VOICE_ERR = e
+        console_log(f"Голосовой стек недоступен: {e}", level="WARNING")
+        return False
 
 
 # ==================== НАСТРОЙКИ ====================
@@ -99,7 +123,7 @@ OLLAMA_POLL_INTERVAL = 0.5            # опрос HTTP при ожидании 
 OLLAMA_LAUNCH_STEP_TIMEOUT = 5        # лимит на каждый способ запуска
 OLLAMA_CLIENT_TIMEOUT = 10            # ollama.exe list сам ждёт ~5 с
 LOG_MAX_BYTES = 1024 * 1024           # при открытии обрезаем лог до ~1 МБ
-SINGLE_INSTANCE_NAME = "Local\AliceSingleInstance"
+SINGLE_INSTANCE_NAME = r"Local\AliceSingleInstance"
 
 # Включаются последовательно по блокам: 1 → B → C → E → D.
 FEATURES = {
@@ -118,6 +142,8 @@ OLLAMA_LOG_HANDLES = []
 MODEL_MISSING = False
 SINGLE_INSTANCE_HANDLE = None
 SINGLE_INSTANCE_FD = None
+GUI_WINDOW = None
+CONSOLE_LAST = {}
 
 # Архитектурные заготовки: НЕ реализованы в этой итерации.
 FUTURE_HOOKS = {
@@ -289,6 +315,71 @@ def log_event(message, **fields):
         pass
 
 
+def console_log(message, level="INFO", key=None, min_interval=0.0):
+    """Единый вывод диагностики в консоль PowerShell + дубль в alice.log."""
+    try:
+        now = time.monotonic()
+        if key is not None and min_interval:
+            if now - CONSOLE_LAST.get(key, -1e9) < min_interval:
+                return
+            CONSOLE_LAST[key] = now
+        line = f"[{time.strftime('%H:%M:%S')}] {level}: {message}"
+        print(line, flush=True)
+        log_event(f"CONSOLE {level}: {message}")
+    except Exception:
+        pass
+
+
+def console_key(text):
+    """Убирает '(N c)', чтобы секундные тики не заваливали консоль."""
+    return re.sub(r"\s*\(\d+\s*c\)", "", text).strip()
+
+
+def install_warning_hooks():
+    """Python-warnings идут в консоль и лог, а не теряются."""
+    def showwarning(message, category, filename, lineno, file=None, line=None):
+        console_log(
+            f"{category.__name__}: {message} ({filename}:{lineno})",
+            level="WARNING",
+            key=f"warn:{category.__name__}:{message}",
+            min_interval=1.0,
+        )
+    warnings.showwarning = showwarning
+
+
+def report_exception(exc_type, exc, tb, origin="приложение"):
+    """Общий обработчик: traceback в консоль/лог + красная строка в GUI."""
+    try:
+        trace = "".join(traceback.format_exception(exc_type, exc, tb))
+        short = f"Перехвачена ошибка ({origin}): {exc}. Подробности: {log_path_text()}"
+        print(trace, file=sys.stderr, flush=True)
+        console_log(short, level="ERROR")
+        log_event("EXCEPTION", origin=origin, traceback=trace)
+        if GUI_WINDOW is not None and "on_global_error" not in origin:
+            try:
+                GUI_WINDOW.error_signal.emit(short)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def install_exception_hooks():
+    """sys.excepthook + threading.excepthook, без завершения процесса."""
+    def main_hook(exc_type, exc, tb):
+        report_exception(exc_type, exc, tb, "главный поток")
+
+    def thread_hook(args):
+        name = getattr(getattr(args, "thread", None), "name", "?")
+        report_exception(
+            args.exc_type, args.exc_value, args.exc_traceback,
+            f"поток {name}",
+        )
+
+    sys.excepthook = main_hook
+    threading.excepthook = thread_hook
+
+
 def log_tail(limit=8):
     try:
         lines = alice_log_path().read_text(encoding="utf-8", errors="replace").splitlines()
@@ -304,9 +395,10 @@ def with_log_path(text):
 
 
 def ensure_status(status, text, started=None):
-    """Статус в ленту с таймером + обязательная запись в лог-файл."""
+    """Статус в ленту с таймером + лог + консоль (секундные тики с throttle)."""
     emit_status(status, text, started)
     log_event(f"СТАТУС: {text}")
+    console_log(text, level="INFO", key=console_key(text), min_interval=1.0)
 
 
 def ollama_api_get(path, timeout=OLLAMA_API_TIMEOUT):
@@ -515,8 +607,10 @@ def spawn_ollama_process(args, label, status):
     if flags:
         kwargs["creationflags"] = flags
     proc = subprocess.Popen(args, **kwargs)
+    pid = getattr(proc, "pid", "?")
     OLLAMA_TRIED_PATHS.append(str(args[0]))
-    log_event("SPAWN", label=label, pid=getattr(proc, "pid", "?"), cmd=" ".join(args))
+    log_event("SPAWN", label=label, pid=pid, cmd=" ".join(args))
+    ensure_status(status, f"Ollama запущена (PID {pid})")
     return proc
 
 
@@ -1042,6 +1136,10 @@ def ensure_ollama(status=print, timeout=None):
     ok, payload, error = ollama_api_get("/api/version", OLLAMA_API_TIMEOUT)
     if ok:
         log_event("HTTP OK", version=payload)
+        alive_procs = ollama_processes()
+        if alive_procs:
+            pids = ", ".join(str(p.pid) for p in alive_procs)
+            ensure_status(status, f"Ollama запущена (PID {pids})")
         ensure_status(status, "Ollama: ок (HTTP API отвечает).")
         ensure_status(status, "Лишние процессы не запускаю.")
         return finish_ollama_success(status)
@@ -1049,6 +1147,9 @@ def ensure_ollama(status=print, timeout=None):
     log_event("HTTP FAIL", error=error)
     ensure_status(status, "Ollama API не отвечает. Смотрю процессы…")
     procs = ollama_processes()
+    if procs:
+        pids = ", ".join(str(p.pid) for p in procs)
+        ensure_status(status, f"Ollama запущена (PID {pids})")
     ensure_status(status, f"Процессы Ollama: {format_processes(procs)}")
     log_event("Процессы Ollama", processes=format_processes(procs))
 
@@ -1703,8 +1804,8 @@ def find_voice(name):
             direct = root / fname
             if direct.exists():
                 return direct
-            for p in root.rglob(fname):
-                return p
+            for item in root.rglob(fname):
+                return item
         except OSError:
             continue
     p = Path.home() / fname
@@ -1713,6 +1814,11 @@ def find_voice(name):
 
 def calibrate_threshold(status=None):
     """Меряет шум комнаты и выставляет порог срабатывания на речь."""
+    if not load_voice_stack(status=status):
+        emit_status(status, "Микрофон недоступен, использую порог по умолчанию.")
+        return 0.01
+    np = VOICE_STACK["np"]
+    sd = VOICE_STACK["sd"]
     emit_status(status, "Калибровка микрофона — помолчи полсекунды...")
     try:
         data = sd.rec(int(0.6 * SR), samplerate=SR, channels=1, dtype="float32")
@@ -1727,6 +1833,11 @@ def calibrate_threshold(status=None):
 
 def listen(threshold, status=None):
     """Слушает микрофон. Возвращает речь (float32, 16 кГц) или None при тишине."""
+    if not load_voice_stack(status=status):
+        emit_status(status, "Микрофон недоступен.")
+        return None
+    np = VOICE_STACK["np"]
+    sd = VOICE_STACK["sd"]
     block = int(SR * 0.03)
     pre = []
     buf = []
@@ -1782,11 +1893,15 @@ def transcribe(model, audio):
         beam_size=5,
         no_speech_threshold=0.5,
     )
-    return "".join(s.text for s in segments).strip()
+    return "".join(seg.text for seg in segments).strip()
 
 
 def say(voice, text):
     """Озвучивает текст голосом Piper и ждёт конца воспроизведения."""
+    if not load_voice_stack(need_tts=True):
+        print(f"[Не удалось озвучить: {VOICE_ERR}]")
+        return
+    winsound = VOICE_STACK["winsound"]
     try:
         with wave.open(str(REPLY_WAV), "wb") as f:
             voice.synthesize_wav(text, f)
@@ -1798,10 +1913,13 @@ def say(voice, text):
 def main_voice():
     global MODEL
     print("=== Голосовая Алиса ===")
-    if not VOICE_OK:
+    if not load_voice_stack(need_stt=True, need_tts=True, status=print):
         print(f"Голосовой стек не установлен: {VOICE_ERR}")
         print("Выполни:  pip install faster-whisper piper-tts sounddevice numpy")
         return 1
+
+    WhisperModel = VOICE_STACK["WhisperModel"]
+    PiperVoice = VOICE_STACK["PiperVoice"]
 
     if not ensure_ollama(print):
         print(f"Система: {OLLAMA_LAST_ERROR or with_log_path('Ollama недоступна.')}")
@@ -1897,7 +2015,10 @@ def main_voice():
 # ==================== GUI-РЕЖИМ (PySide6) ====================
 def main_gui():
     try:
-        from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+        from PySide6.QtCore import (
+            QObject, QThread, QTimer, Qt, QtMsgType, Signal, Slot,
+            qInstallMessageHandler,
+        )
         from PySide6.QtGui import QFont, QTextCursor
         from PySide6.QtWidgets import (
             QApplication, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -1907,6 +2028,39 @@ def main_gui():
         print(f"Не удалось загрузить PySide6: {e}")
         print("Выполни:  pip install PySide6")
         return 1
+
+    MAIN_QT_THREAD = QThread.currentThread()
+    try:
+        def qt_message_handler(mode, context, message):
+            mode_name = getattr(mode, "name", str(mode))
+            console_log(
+                f"Qt {mode_name}: {message}",
+                level="WARNING",
+                key=f"qt:{mode_name}:{message}",
+                min_interval=1.0,
+            )
+        qInstallMessageHandler(qt_message_handler)
+    except Exception as e:
+        console_log(f"Не удалось установить обработчик Qt-сообщений: {e}", level="WARNING")
+
+    def gui_only(fn):
+        """Слот/метод GUI: из чужого потока уходим через queued ui_call, ошибки не роняем окно."""
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            try:
+                current = QThread.currentThread()
+                owner = self.thread() if hasattr(self, "thread") else MAIN_QT_THREAD
+                if current is not owner:
+                    self.ui_call.emit((fn.__name__, args, kwargs))
+                    return None
+            except Exception:
+                pass
+            try:
+                return fn(self, *args, **kwargs)
+            except Exception:
+                report_exception(*sys.exc_info(), origin=f"слот {fn.__name__}")
+                return None
+        return wrapper
 
     class StartupWorker(QObject):
         status = Signal(str)
@@ -2007,11 +2161,14 @@ def main_gui():
         completed = Signal(str, bool)
 
         def run(self):
-            if not VOICE_OK:
-                self.completed.emit("Голосовой стек не установлен. Проверь микрофон и зависимости.", False)
+            if not load_voice_stack(need_stt=True, status=self.status.emit):
+                self.completed.emit(
+                    f"Голосовой стек не установлен: {VOICE_ERR}. Проверь микрофон и зависимости.",
+                    False,
+                )
                 return
             try:
-                self.status.emit("Грузим распознавание речи…")
+                WhisperModel = VOICE_STACK["WhisperModel"]
                 stt = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
                 threshold = calibrate_threshold(self.status.emit)
                 audio = listen(threshold, self.status.emit)
@@ -2027,8 +2184,13 @@ def main_gui():
                 self.completed.emit(f"Микрофон недоступен или слишком шумно: {e}", False)
 
     class ChatWindow(QMainWindow):
+        error_signal = Signal(str)
+        ui_call = Signal(object)
+
         def __init__(self):
             super().__init__()
+            global GUI_WINDOW
+            GUI_WINDOW = self
             self.setWindowTitle(f"Алиса {ALICE_VERSION} — локальный ассистент")
             self.resize(860, 620)
             self.setMinimumSize(560, 430)
@@ -2085,11 +2247,11 @@ def main_gui():
             self.input = QLineEdit(self)
             self.input.setPlaceholderText("Напиши сообщение и нажми Enter...")
             self.input.setFont(QFont("Segoe UI", 11))
-            self.input.returnPressed.connect(self.send_message)
+            self.input.returnPressed.connect(self.send_message, Qt.QueuedConnection)
             row.addWidget(self.input, 1)
 
             self.send_button = QPushButton("Отправить", self)
-            self.send_button.clicked.connect(self.send_message)
+            self.send_button.clicked.connect(self.send_message, Qt.QueuedConnection)
             row.addWidget(self.send_button)
 
             self.action_buttons = [self.send_button]
@@ -2097,27 +2259,27 @@ def main_gui():
             if FEATURES["deepseek"]:
                 self.deepseek_button = QPushButton("DeepSeek", self)
                 self.deepseek_button.setToolTip("Отправить вопрос в DeepSeek")
-                self.deepseek_button.clicked.connect(lambda: self.send_message(True))
+                self.deepseek_button.clicked.connect(lambda: self.send_message(True), Qt.QueuedConnection)
                 row.addWidget(self.deepseek_button)
                 self.action_buttons.append(self.deepseek_button)
 
             if FEATURES["deepseek"] or FEATURES["vk_music"]:
                 self.browser_button = QPushButton("Браузер", self)
                 self.browser_button.setToolTip("Один раз настроить профиль браузера ассистента")
-                self.browser_button.clicked.connect(self.open_browser_setup)
+                self.browser_button.clicked.connect(self.open_browser_setup, Qt.QueuedConnection)
                 row.addWidget(self.browser_button)
                 self.action_buttons.append(self.browser_button)
 
             self.retry_button = QPushButton("Повторить", self)
             self.retry_button.setToolTip("Повторить запуск Ollama (/старт)")
-            self.retry_button.clicked.connect(self.start_ollama_check)
+            self.retry_button.clicked.connect(self.start_ollama_check, Qt.QueuedConnection)
             row.addWidget(self.retry_button)
             self.action_buttons.append(self.retry_button)
 
             if FEATURES["voice_gui"]:
                 self.mic_button = QPushButton("🎙", self)
                 self.mic_button.setToolTip("Записать голосом — текст попадёт в поле ввода")
-                self.mic_button.clicked.connect(self.start_voice_capture)
+                self.mic_button.clicked.connect(self.start_voice_capture, Qt.QueuedConnection)
                 row.addWidget(self.mic_button)
                 self.action_buttons.append(self.mic_button)
 
@@ -2126,21 +2288,46 @@ def main_gui():
             self.status_label = QLabel("Проверяю Ollama...", self)
             layout.addWidget(self.status_label)
 
+            self.error_signal.connect(self.on_global_error, Qt.QueuedConnection)
+            self.ui_call.connect(self.on_ui_call, Qt.QueuedConnection)
             self.append_status(f"Алиса {ALICE_VERSION} запущена. Проверяю Ollama...")
             self.set_busy(True, "Проверяю Ollama...")
             self.input.setFocus()
             QTimer.singleShot(0, self.start_ollama_check)
 
             self.health_timer = QTimer(self)
-            self.health_timer.timeout.connect(self.start_health_check)
+            self.health_timer.timeout.connect(self.start_health_check, Qt.QueuedConnection)
             self.health_timer.start(HEALTH_INTERVAL_MS)
             QTimer.singleShot(0, self.start_health_check)
 
+        # ---------- защита GUI-потока ----------
+        @Slot(object)
+        @gui_only
+        def on_ui_call(self, payload):
+            name, args, kwargs = payload
+            getattr(self, name)(*args, **kwargs)
+
+        @Slot(str)
+        @gui_only
+        def on_global_error(self, message):
+            self.append_error(message)
+            self.set_busy(False, "Ошибка перехвачена")
+            self.input.setEnabled(True)
+            self.input.setFocus()
+
         # ---------- лента ----------
+        @gui_only
         def clear_live_status(self):
             self.live_marker = None
 
+        @gui_only
         def set_live_status(self, text):
+            console_log(
+                f"Система: {text}",
+                level="INFO",
+                key=console_key(text),
+                min_interval=5.0,
+            )
             try:
                 cursor = self.chat.textCursor()
                 cursor.movePosition(QTextCursor.End)
@@ -2158,34 +2345,44 @@ def main_gui():
             self.scroll_down()
 
         @Slot(str)
+        @gui_only
         def append_status(self, text):
+            console_log(text, level="INFO", key=console_key(text), min_interval=1.0)
             self.clear_live_status()
             self.chat.append(f"Система: {text}")
             self.scroll_down()
 
+        @gui_only
         def append_error(self, text):
+            console_log(text, level="ERROR", key=console_key(text), min_interval=1.0)
             self.clear_live_status()
             self.chat.appendHtml(
                 f'<span style="color:#ff6b6b;">Система: {html.escape(text)}</span>'
             )
             self.scroll_down()
 
+        @gui_only
         def append_user(self, text):
+            console_log(f"Ты: {text}", level="USER")
             self.clear_live_status()
             self.chat.append(f"Ты: {text}")
             self.scroll_down()
 
+        @gui_only
         def append_deepseek(self, text):
+            console_log(f"DeepSeek: {text}", level="WEB")
             self.clear_live_status()
             self.chat.append(f"DeepSeek: {text}")
             self.scroll_down()
 
+        @gui_only
         def begin_assistant(self):
             self.clear_live_status()
             self.chat.append("Алиса: ")
             self.assistant_open = True
             self.scroll_down()
 
+        @gui_only
         def finish_assistant(self):
             if self.assistant_open:
                 self.chat.append("")
@@ -2193,18 +2390,21 @@ def main_gui():
                 self.scroll_down()
 
         @Slot(str)
+        @gui_only
         def append_chunk(self, chunk):
             self.clear_live_status()
             self.chat.moveCursor(QTextCursor.End)
             self.chat.insertPlainText(chunk)
             self.scroll_down()
 
+        @gui_only
         def scroll_down(self):
             self.chat.moveCursor(QTextCursor.End)
             self.chat.ensureCursorVisible()
             bar = self.chat.verticalScrollBar()
             bar.setValue(bar.maximum())
 
+        @gui_only
         def set_busy(self, busy, label=None):
             self.busy = busy
             self.input.setEnabled(not busy)
@@ -2216,6 +2416,7 @@ def main_gui():
                 self.status_label.setText(label)
 
         @Slot(str)
+        @gui_only
         def on_progress(self, text):
             self.status_label.setText(text)
             # Во время стриминга ответа не вставляем таймер в ленту,
@@ -2255,6 +2456,7 @@ def main_gui():
                 self.set_live_status(text)
 
         # ---------- Ollama ----------
+        @gui_only
         def start_ollama_check(self):
             if self.busy and self.startup_worker is not None:
                 return
@@ -2263,8 +2465,8 @@ def main_gui():
             thread = QThread(self)
             worker = StartupWorker()
             worker.moveToThread(thread)
-            worker.status.connect(self.on_progress)
-            worker.completed.connect(self.on_startup_done)
+            worker.status.connect(self.on_progress, Qt.QueuedConnection)
+            worker.completed.connect(self.on_startup_done, Qt.QueuedConnection)
             worker.completed.connect(thread.quit)
             worker.completed.connect(worker.deleteLater)
             thread.started.connect(worker.run)
@@ -2274,6 +2476,7 @@ def main_gui():
             thread.start()
 
         @Slot(bool)
+        @gui_only
         def on_startup_done(self, ok):
             self.clear_live_status()
             self.ollama_ready = ok
@@ -2290,11 +2493,13 @@ def main_gui():
             self.start_health_check()
 
         # ---------- здоровье ----------
+        @gui_only
         def update_indicator(self, label, name, state):
             colors = {"ok": "#4ec9b0", "warn": "#dcdcaa", "err": "#f14c4c"}
             label.setText(f"● {name}: {state_word(state)}")
             label.setStyleSheet(f"color: {colors.get(state, '#dcdcaa')};")
 
+        @gui_only
         def start_health_check(self):
             if self.health_busy:
                 return
@@ -2302,7 +2507,7 @@ def main_gui():
             thread = QThread(self)
             worker = HealthWorker(max(0, len(self.history) - 1), self.browser_health)
             worker.moveToThread(thread)
-            worker.result.connect(self.on_health_result)
+            worker.result.connect(self.on_health_result, Qt.QueuedConnection)
             worker.result.connect(thread.quit)
             worker.result.connect(worker.deleteLater)
             thread.started.connect(worker.run)
@@ -2312,6 +2517,7 @@ def main_gui():
             thread.start()
 
         @Slot(str, str, str, str)
+        @gui_only
         def on_health_result(self, ollama_state, model_state, browser_state, text):
             self.health_busy = False
             self.health = {"ollama": ollama_state, "model": model_state, "browser": browser_state}
@@ -2322,6 +2528,7 @@ def main_gui():
                 self.update_indicator(self.browser_indicator, "Браузер", browser_state)
 
         # ---------- браузер ----------
+        @gui_only
         def ensure_browser_worker(self):
             if not playwright_available():
                 self.append_error("Playwright не установлен. Выполни: pip install playwright")
@@ -2330,14 +2537,15 @@ def main_gui():
                 self.browser_worker = BrowserWorker()
                 self.browser_thread = QThread(self)
                 self.browser_worker.moveToThread(self.browser_thread)
-                self.browser_worker.status.connect(self.on_progress)
-                self.browser_worker.result.connect(self.on_browser_result)
+                self.browser_worker.status.connect(self.on_progress, Qt.QueuedConnection)
+                self.browser_worker.result.connect(self.on_browser_result, Qt.QueuedConnection)
                 self.browser_thread.started.connect(self.browser_worker.run)
                 self.browser_thread.finished.connect(self.browser_thread.deleteLater)
                 self.browser_thread.start()
             return True
 
         @Slot()
+        @gui_only
         def open_browser_setup(self):
             if self.busy:
                 return
@@ -2351,6 +2559,7 @@ def main_gui():
             self.set_busy(True, "Открываю браузер…")
             self.browser_worker.submit(intent)
 
+        @gui_only
         def start_browser_intent(self, intent):
             if not self.ensure_browser_worker():
                 return
@@ -2359,6 +2568,7 @@ def main_gui():
             self.browser_worker.submit(intent)
 
         @Slot(str, bool, str)
+        @gui_only
         def on_browser_result(self, payload, ok, kind):
             self.clear_live_status()
             if not ok:
@@ -2377,6 +2587,7 @@ def main_gui():
             self.start_health_check()
 
         # ---------- локальный мозг ----------
+        @gui_only
         def start_chat(self, intent):
             if not self.ollama_ready:
                 self.append_error("Ollama недоступна. Запусти её и перезапусти Алису.")
@@ -2391,9 +2602,9 @@ def main_gui():
             thread = QThread(self)
             worker = ChatWorker(self.history)
             worker.moveToThread(thread)
-            worker.chunk.connect(self.append_chunk)
-            worker.status.connect(self.on_progress)
-            worker.completed.connect(self.on_chat_completed)
+            worker.chunk.connect(self.append_chunk, Qt.QueuedConnection)
+            worker.status.connect(self.on_progress, Qt.QueuedConnection)
+            worker.completed.connect(self.on_chat_completed, Qt.QueuedConnection)
             worker.completed.connect(thread.quit)
             worker.completed.connect(worker.deleteLater)
             thread.started.connect(worker.run)
@@ -2403,10 +2614,12 @@ def main_gui():
             thread.start()
 
         @Slot(str, bool)
+        @gui_only
         def on_chat_completed(self, payload, ok):
             self.clear_live_status()
             self.finish_assistant()
             if ok:
+                console_log(f"Алиса: {payload}", level="ASSISTANT")
                 if payload:
                     self.history.append({"role": "assistant", "content": payload})
                 self.set_busy(False, "Готово")
@@ -2417,12 +2630,13 @@ def main_gui():
             self.input.setFocus()
 
         # ---------- команды ----------
+        @gui_only
         def start_model_list(self):
             self.set_busy(True, "Проверяю модели…")
             thread = QThread(self)
             worker = FunctionWorker(lambda: "\n".join(f"  - {n}" for n in list_models()) or "Скачанных моделей нет.")
             worker.moveToThread(thread)
-            worker.completed.connect(self.on_model_list)
+            worker.completed.connect(self.on_model_list, Qt.QueuedConnection)
             worker.completed.connect(thread.quit)
             worker.completed.connect(worker.deleteLater)
             thread.started.connect(worker.run)
@@ -2432,6 +2646,7 @@ def main_gui():
             thread.start()
 
         @Slot(str, bool)
+        @gui_only
         def on_model_list(self, payload, ok):
             if ok:
                 self.append_status("Скачанные модели:\n" + payload)
@@ -2440,6 +2655,7 @@ def main_gui():
             self.set_busy(False, "Готово")
 
         @Slot()
+        @gui_only
         def send_message(self, force_deepseek=False):
             if self.busy:
                 return
@@ -2452,6 +2668,7 @@ def main_gui():
             intent = classify_command(text)
             self.handle_intent(intent)
 
+        @gui_only
         def handle_intent(self, intent):
             global MODEL
             kind = intent.get("kind")
@@ -2505,6 +2722,7 @@ def main_gui():
             self.append_error("Не поняла команду.")
 
         # ---------- голосовая кнопка ----------
+        @gui_only
         def start_autostart(self):
             if self.busy:
                 return
@@ -2512,7 +2730,8 @@ def main_gui():
             self.set_busy(True, "Настраиваю автозагрузку…")
             thread = QThread(self)
             worker = FunctionWorker(lambda: autostart_ollama()[1])
-            worker.completed.connect(self.on_autostart_result)
+            worker.moveToThread(thread)
+            worker.completed.connect(self.on_autostart_result, Qt.QueuedConnection)
             worker.completed.connect(thread.quit)
             worker.completed.connect(worker.deleteLater)
             thread.started.connect(worker.run)
@@ -2522,6 +2741,7 @@ def main_gui():
             thread.start()
 
         @Slot(str, bool)
+        @gui_only
         def on_autostart_result(self, text, ok):
             self.clear_live_status()
             self.autostart_worker = None
@@ -2531,21 +2751,24 @@ def main_gui():
                 self.append_error(with_log_path(text))
             self.set_busy(False, "Готово" if ok else "Автозагрузка")
 
+        @gui_only
         def start_voice_capture(self):
             if self.busy:
                 return
             if not FEATURES["voice_gui"]:
                 return
-            if not VOICE_OK:
-                self.append_error("Голосовой стек не установлен. Проверь микрофон и зависимости.")
+            if not load_voice_stack(need_stt=True):
+                self.append_error(
+                    f"Голосовой стек не установлен: {VOICE_ERR}. Проверь микрофон и зависимости."
+                )
                 return
             self.clear_live_status()
             self.set_busy(True, "Слушаю…")
             thread = QThread(self)
             worker = VoiceWorker()
             worker.moveToThread(thread)
-            worker.status.connect(self.on_progress)
-            worker.completed.connect(self.on_voice_result)
+            worker.status.connect(self.on_progress, Qt.QueuedConnection)
+            worker.completed.connect(self.on_voice_result, Qt.QueuedConnection)
             worker.completed.connect(thread.quit)
             worker.completed.connect(worker.deleteLater)
             thread.started.connect(worker.run)
@@ -2555,6 +2778,7 @@ def main_gui():
             thread.start()
 
         @Slot(str, bool)
+        @gui_only
         def on_voice_result(self, text, ok):
             self.clear_live_status()
             if ok:
@@ -2566,7 +2790,11 @@ def main_gui():
                 self.set_busy(False, "Микрофон")
             self.input.setFocus()
 
+        @gui_only
         def closeEvent(self, event):
+            global GUI_WINDOW
+            if GUI_WINDOW is self:
+                GUI_WINDOW = None
             try:
                 if self.browser_worker:
                     self.browser_worker.stop()
@@ -2614,7 +2842,16 @@ def main_gui():
     """)
     window = ChatWindow()
     window.show()
-    return app.exec()
+    while True:
+        try:
+            return app.exec()
+        except Exception:
+            report_exception(*sys.exc_info(), origin="цикл событий Qt")
+            try:
+                if not window.isVisible():
+                    return 1
+            except Exception:
+                return 1
 
 
 # ==================== ТОЧКА ВХОДА ====================
@@ -2649,6 +2886,8 @@ def main():
 
 
 init_log()
+install_warning_hooks()
+install_exception_hooks()
 
 if __name__ == "__main__":
     try:
